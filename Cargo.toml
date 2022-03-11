@@ -1,0 +1,16 @@
+[package]
+name = "service_manager"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.21"
+tokio = { version = "1", features = ["full"] }
+warp = { version = "0.3.1", features = ["tls"] }
+tokio-stream = "0.1.6"
+serde = { version = "1.0", features = ["derive"]}
+serde_json = "1.0"
+dotenv = "0.15.0"
+uuid = { version = "0.8.2", features = ["serde", "v4"] }
