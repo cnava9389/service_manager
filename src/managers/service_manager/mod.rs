@@ -85,7 +85,15 @@ impl<'a> ServiceManager<'a> {
     async fn start_server(manager:Arc<ServiceManager<'static>>) -> Res<()> {
         dotenv::dotenv().ok();
 
-        let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid socket address");
+        let socket_addr:SocketAddr;
+        match std::env::args().nth(2) {
+            Some(server)=> {
+                socket_addr = server.parse().expect("valid socket address");
+            },
+            None => {
+                socket_addr = "127.0.0.1:9000".parse().expect("valid socket address");
+            }
+        };
 
         // service manager for http and sockets
         let clone = manager.clone();
@@ -118,10 +126,10 @@ impl<'a> ServiceManager<'a> {
         
         if test_env == "true" {
             let server = warp::serve(routes).try_bind(socket_addr);
-            println!("Running web server on 127.0.0.1:9000!");
+            println!("Running web server on {}!",socket_addr);
             server.await
         }else {
-            println!("Running server on 433!");
+            println!("Running server on :433!");
             warp::serve(routes).tls().cert_path("./fullchain.pem").key_path("./privkey.pem").run(([127,0,0,1],433)).await;
         }
         Ok(())
@@ -130,10 +138,23 @@ impl<'a> ServiceManager<'a> {
     // ! need to be able to take any impl manager
     /// starts the tcp server that communicates with the service managers on :7878
     async fn start_tcp_server(manager: Arc<dyn Manager>, port: &str) {
-        let listener = TcpListener::bind(format!("127.0.0.1:{}",port)).await;
+        let addr;
+        if port.is_empty() {
+            match std::env::args().nth(2) {
+                Some(address) => {
+                    addr = address;
+                },
+                None =>  {
+                    addr = String::from("127.0.0.1:5000");
+                },
+            }
+        } else {
+            addr = format!("127.0.0.1:{}",port);
+        }
+        let listener = TcpListener::bind(&addr).await;
         match listener {
             Ok(listener) => {
-                println!("starting tcp server on 127.0.0.1:{}!",port);
+                println!("starting tcp server on {}!",&addr);
                 loop {
                     // let (mut socket, _addr) = listener.accept().await.unwrap();
                     match listener.accept().await {
@@ -174,11 +195,6 @@ impl<'a> ServiceManager<'a> {
                                                 let _ = manager.send(e.produce_error(),Sender::TCP(&mut socket));
                                             },
                                         }
-                                        // match socket.write(&buf[..n]).await {
-                                        //     Ok(_) => (),
-                                        //     Err(_) => (),
-                                        // }
-
                                     },
                                     Err(_) => {
                                         let _ = manager.send("server error",Sender::TCP(&mut socket));
@@ -295,6 +311,14 @@ impl Manager for ServiceManager<'_> {
                                             },
                                             None => {
                                                 Err(error::ServerError::INVALID_JSON)
+                                            }
+                                        }
+                                    },
+                                    "DEL" => {
+                                        match result_2 {
+                                            x => {
+                                                let _ = block_on(self.servers.remove_server(x));
+                                                Ok(String::from("Deleted server"))
                                             }
                                         }
                                     }
@@ -427,6 +451,10 @@ pub async fn select_start(arg: &str) {
             let manager = ServiceManager::new();
             let _ = ServiceManager::start_server(manager).await;
         },
+        "database" => {
+            let manager = DataBaseManager::new();
+            let _ = ServiceManager::start_tcp_server(manager,"").await;
+        }
         x => println!("Error unkown input: {}", x)
     }
 }

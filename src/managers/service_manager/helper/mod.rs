@@ -95,7 +95,7 @@ impl<'a> TCPServers<'a> {
         }
     }
 
-    pub async fn remove_server(&self, k:&'a str) -> Res<()> {
+    pub async fn remove_server(&self, k:&str) -> Res<()> {
         let mut ports = self.ports.write().await;
         let mut store = self.store.write().await;
 
