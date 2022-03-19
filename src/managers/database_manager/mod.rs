@@ -254,7 +254,7 @@ impl service_manager::other::Manager for DataBaseManager {
                         Some(x) => {
                             Ok(x.to_string())
                         },
-                        None => Ok(String::from("NOT_FOUND"))
+                        None => Ok(json::JSON::Null.to_string())
                     }
                 }
             },
@@ -382,7 +382,7 @@ fn rec_get(mut key_split:Peekable<Split<&str>>, map: &json::JSON) -> Res<String>
                 let value = map.get(key);
                 match value {
                     Some(val) => Ok(val.to_string()),
-                    None => Ok(String::from("NOT_FOUND")),
+                    None => Ok(json::JSON::Null.to_string()),
                 }
             },
             None => Err(error::ServerError::INVALID_ARG),

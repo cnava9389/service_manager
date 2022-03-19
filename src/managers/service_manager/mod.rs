@@ -258,9 +258,14 @@ impl Manager for ServiceManager<'_> {
                                                     let result_3 = result.next().unwrap_or_else(|| "");
                                                     match block_on(self.contains_s_p(x, result_3)) {
                                                         Ok(_) => {
-                                                            let addr = format!("127.0.0.1:{}",result_3);
-                                                            let port = result_3.to_owned();
-                                                            match TcpStream::connect(addr){
+                                                            let addr;
+                                                            let result_3 = result_3.to_owned();
+                                                            if result_3.contains(":") {
+                                                                addr = result_3;
+                                                            }else {
+                                                                addr = format!("127.0.0.1:{}",result_3);
+                                                            }
+                                                            match TcpStream::connect(&addr){
                                                                 Ok(stream) => {
                                                                     let static_name = |x:&str| {
                                                                         match x {
@@ -270,7 +275,7 @@ impl Manager for ServiceManager<'_> {
                                                                         }
                                                                     };
                                                                     let name = static_name(x);
-                                                                    let _ = block_on(self.servers.insert_port(name, port));
+                                                                    let _ = block_on(self.servers.insert_port(name, addr));
                                                                     match block_on(self.new_server(name, stream)) {
                                                                         Ok(_) => {
                                                                             match block_on(self.send_to_server(name, "NEW")){
