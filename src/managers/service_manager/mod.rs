@@ -1,8 +1,9 @@
+use std::fmt;
 use std::sync::Arc;
-use super::{json};
+use super::{json, error, database_manager::DataBaseManager};
 use tokio::net::{TcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{mpsc};
 use tokio::task::JoinHandle;
 use std::io::{self, BufRead, prelude::*};
 use futures::executor::block_on;
@@ -14,43 +15,81 @@ use warp::Filter;
 use std::net::SocketAddr;
 use uuid::Uuid;
 
-mod helper;
-use helper::{Store, EventQueue, Manager, Sender};
+pub mod helper;
+use helper::{Store, EventQueue, Manager, Sender, TCPServers};
+
+pub use helper as other;
 
 
 
-type Res<T> = Result<T, Box<dyn std::error::Error>>;
+type Res<T> = Result<T, error::ServerError>;
 
 
 #[derive(Debug)]
 /// The service manager recieves and logs any operation and forwards it to the appropriate manager to deal with
-struct ServiceManager {
-    store: RwLock<Store>,
-    event_queue: RwLock<EventQueue>
+struct ServiceManager<'a> {
+    store: Store,
+    servers: TCPServers<'a>,
+    event_queue: EventQueue
 }
 
-impl ServiceManager {
+impl<'a> ServiceManager<'a> {
+    // ---------------------------------------------------------------- self
+    async fn send_to_server(&self, server_key:&str, message:&str) -> Res<String> {
+        
+        match self.servers.send_to_server(server_key,message).await {
+            Ok(x)=> {
+                Ok(x)
+            },
+            Err(e) => Err(e)
+        }
+    }
+
+    async fn new_server(&self, k:&'a str, v: TcpStream) -> Res<()> {
+        let servers = &self.servers; 
+        if !k.is_empty() {
+            if !servers.contains_key(k).await {
+            match servers.insert(k,v).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(e)
+            }
+            }else {
+                Err(error::ServerError::TAKEN)
+            }
+        }else{Err(error::ServerError::INVALID_ARG)}
+        
+    }
+
+    // async fn remove_server(&self, k:&'a str) -> Res<()> {
+    //     let mut server = self.servers.write().await;
+        
+    //     Ok(())
+    // }
+
+    async fn contains_s_p(&self,k:&str,v:&str) -> Res<()> {
+        self.servers.contains(k, v).await
+    }
 
     // ---------------------------------------------------------------- no self
 
     /// returns an arc service manager for multiple thread support
-    fn new() -> Arc<ServiceManager> {
+    fn new() -> Arc<ServiceManager<'a>> {
         Arc::new(ServiceManager{
-            store: RwLock::new(Store::new()),
-            event_queue: RwLock::new(EventQueue::new()),
+            store:Store::new(),
+            servers:TCPServers::new(),
+            event_queue:EventQueue::new(),
         })
     }
 
     /// starts a webserver with a websocket to connect to clients and logs any operation and forwards it to the appropriate manager.
-    async fn start_server() -> Res<()> {
+    async fn start_server(manager:Arc<ServiceManager<'static>>) -> Res<()> {
         dotenv::dotenv().ok();
 
         let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("valid socket address");
 
         // service manager for http and sockets
-        let manager = ServiceManager::new();
         let clone = manager.clone();
-        let manager_filter = warp::any().map(move || manager.clone());
+        let manager_filter = warp::any().map(move || clone.clone());
         
         let chat = warp::path("ws")
             .and(warp::ws())
@@ -71,9 +110,11 @@ impl ServiceManager {
         
         let test_env = dotenv::var("TEST").unwrap_or_else(|_|"false".to_string());
         
-        tokio::task::spawn_blocking(move || {
-            let _ = block_on(ServiceManager::start_tcp_server(clone,"7878"));
-        });
+        // let clone = manager.clone();
+        // tokio::task::spawn_blocking(move || {
+        //     let _ = block_on(ServiceManager::start_tcp_server(clone,"7878"));
+        // });
+
         
         if test_env == "true" {
             let server = warp::serve(routes).try_bind(socket_addr);
@@ -86,7 +127,7 @@ impl ServiceManager {
         Ok(())
     }
 
-    
+    // ! need to be able to take any impl manager
     /// starts the tcp server that communicates with the service managers on :7878
     async fn start_tcp_server(manager: Arc<dyn Manager>, port: &str) {
         let listener = TcpListener::bind(format!("127.0.0.1:{}",port)).await;
@@ -94,35 +135,61 @@ impl ServiceManager {
             Ok(listener) => {
                 println!("starting tcp server on 127.0.0.1:{}!",port);
                 loop {
-                    let (mut socket, _addr) = listener.accept().await.unwrap();
-                    let manager = manager.clone();
-                    println!("connection made");
-                    // A new task is spawned for each inbound socket. The socket is
-                    // moved to the new task and processed there.
-                    tokio::spawn(async move {
-                        let _manager = manager;
-                        let mut buf = [0; 1024];
-                        
-                        // In a loop, read data from the socket and write the data back.
-                        loop {
-                            let n = match socket.read(&mut buf).await {
-                                // socket closed
-                                Ok(n) if n == 0 => return,
-                                Ok(n) => n,
-                                Err(e) => {
-                                    eprintln!("failed to read from socket; err = {:?}", e);
-                                    return;
+                    // let (mut socket, _addr) = listener.accept().await.unwrap();
+                    match listener.accept().await {
+                        Ok((mut socket, _addr)) => {
+                            let manager = manager.clone();
+                        // A new task is spawned for each inbound socket. The socket is
+                        // moved to the new task and processed there.
+                        tokio::spawn(async move {
+                            let manager = manager;
+                            let mut buf = [0; 1024];
+                            
+                            // In a loop, read data from the socket and write the data back.
+                            loop {
+                                let n = match socket.read(&mut buf).await {
+                                    // socket closed
+                                    Ok(n) if n == 0 => return,
+                                    Ok(n) => n,
+                                    Err(_) => {
+                                        println!("failed to read from connection or remote host disconnected");
+                                        return
+                                    }
+                                };
+
+                                
+                                match std::str::from_utf8(&buf[..n]) {
+                                    Ok(x) => {
+                                        // process and get data
+                                        match manager.process_message(x, "") {
+                                            Ok(x) => {
+                                                match manager.send(&x, Sender::TCP(&mut socket)) {
+                                                    Ok(_) => (),
+                                                    Err(e) => {
+                                                        let _ = manager.send(e.produce_error(),Sender::TCP(&mut socket));
+                                                    }
+                                                }
+                                            },
+                                            Err(e) => {
+                                                let _ = manager.send(e.produce_error(),Sender::TCP(&mut socket));
+                                            },
+                                        }
+                                        // match socket.write(&buf[..n]).await {
+                                        //     Ok(_) => (),
+                                        //     Err(_) => (),
+                                        // }
+
+                                    },
+                                    Err(_) => {
+                                        let _ = manager.send("server error",Sender::TCP(&mut socket));
+                                    },
                                 }
-                            };
-        
-                            // ! socket sends info for tcp
-                            // Write the data back
-                            if let Err(e) = socket.write_all(&buf[0..n]).await {
-                                eprintln!("failed to write to socket; err = {:?}", e);
-                                return;
+
                             }
-                        }
                     });
+                        },
+                        Err(_) => println!("could not make connection"),
+                    }
                 }
             },
             // ! log
@@ -133,56 +200,192 @@ impl ServiceManager {
 
 }
 
-impl Manager for ServiceManager {
-    fn test(&self) {
-        println!("Service manager test");
+impl fmt::Display for ServiceManager<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result{
+        write!(f,"Service Manager: store: ({}), queue: ({}), servers: ({})",self.store,self.event_queue,self.servers)
+    }
+}
+
+impl Manager for ServiceManager<'_> {
+    // this needs to send message to tcp servers via commands and then return the data
+    fn process_message(&self, message: &str, id: &str) -> Res<String> {
+
+        let processed_message = json::to_value_from_str(message);
+        let processed_message = match processed_message {
+            Ok(x) => x,
+            Err(_) => serde_json::Value::Null,
+        };
+
+        
+        match processed_message {
+            serde_json::Value::Null => Err(error::ServerError::INVALID_JSON),
+            serde_json::Value::Bool(_) => Err(error::ServerError::INVALID_JSON),
+            serde_json::Value::Number(_) => Err(error::ServerError::INVALID_JSON),
+            serde_json::Value::String(_) => Err(error::ServerError::INVALID_JSON),
+            serde_json::Value::Array(_) => Err(error::ServerError::INVALID_JSON),
+            serde_json::Value::Object(x_command) => {
+                // ! use command format
+                let command = x_command.get("command");
+                match command {
+                    Some(x) => {
+                        let x = x.as_str();
+                        match x {
+                            Some(x) => {
+                                // ! maybe something faser than a vec?
+                                let mut result = x.split(" ");
+                                let result_1 = result.next().unwrap();
+                                let result_2 = result.next().unwrap_or_else(|| "");
+                                match result_1 {
+                                    "ADD" => {
+                                        match result_2 {
+                                           x => {
+                                                    let result_3 = result.next().unwrap_or_else(|| "");
+                                                    match block_on(self.contains_s_p(x, result_3)) {
+                                                        Ok(_) => {
+                                                            let addr = format!("127.0.0.1:{}",result_3);
+                                                            let port = result_3.to_owned();
+                                                            match TcpStream::connect(addr){
+                                                                Ok(stream) => {
+                                                                    let static_name = |x:&str| {
+                                                                        match x {
+                                                                            "TCP" => "TCP",
+                                                                            "DB" => "DB",
+                                                                            _ => "",
+                                                                        }
+                                                                    };
+                                                                    let name = static_name(x);
+                                                                    let _ = block_on(self.servers.insert_port(name, port));
+                                                                    match block_on(self.new_server(name, stream)) {
+                                                                        Ok(_) => {
+                                                                            match block_on(self.send_to_server(name, "NEW")){
+                                                                                Ok(x) => Ok(format!("{}, id:{}",x,id)),
+                                                                                Err(_) => {
+                                                                                    let _ = block_on(self.servers.remove_server(name));
+                                                                                    Err(error::ServerError::CONNECTION)
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(e) => {
+                                                                            Err(e)
+                                                                        }
+                                                                    }
+                                                                },
+                                                                Err(_) => {
+                                                                    Err(error::ServerError::CONNECTION)
+                                                                },
+                                                            }
+                                                        },
+                                                        Err(e) => {
+                                                            Err(e)
+                                                        }
+                                                    }
+                                            }
+                                            // _ => Ok(format!("Invalid argument: {}",error::ServerError::produce_error(&error::ServerError::INVALID_ARG)))
+                                        }
+                                    },
+                                    "MSG" => {
+                                        let message = x_command.get("message");
+                                        match message {
+                                            Some(msg) => {
+                                                let msg = msg.as_str().unwrap_or_else(|| "Error");
+                                                match block_on(self.send_to_server(result_2, msg)) {
+                                                    Ok(x) => Ok(x),
+                                                    Err(e) => Err(e),
+                                                } 
+                                            },
+                                            None => {
+                                                Err(error::ServerError::INVALID_JSON)
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        let example = json::to_json!({"command":"command_for_service_manager server_name optional_argument","message":"server_command server_argument optional_argument"});
+                                        let example = example.to_string();
+                                        Ok(String::from("Use this format for message\n") + &example)
+                                    }
+                                }
+                            },
+                            None => Err(error::ServerError::INVALID_JSON),
+                        }
+                    },
+                    None => Err(error::ServerError::INVALID_JSON),
+                }
+            },
+        }
     }
 
-    fn process_message<'a>(&self, message: &'a str, sender: Sender) -> Res<&'a str> {
-        Ok(message)
-    }
+    // either sends data to user or tcp servers
+    fn send(&self, message: &str, sender: Sender) -> Res<()> {
+        
+        match sender {
+            // this writes back data from tcp servers
+            Sender::TCP(x) => {
+                match block_on(x.write_all(message.as_bytes())) {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(error::ServerError::NO_VALUE),
+                }
+            },
+            // this writes back to user form webserver
+            Sender::WS(x) => {
+                x.send(Ok(Message::text(message))).expect("Failed to send message");
+                Ok(())
 
-    fn send(&self) -> Res<()> {
-        Ok(())
+            },
+        }
+        
     }
 }
 
 // ---------------------------------------------------------------- private
 
 /// the function that handles the connection to the websocket
-async fn connect(ws: WebSocket, server: Arc<ServiceManager>) {
+async fn connect(ws: WebSocket, server: Arc<ServiceManager<'_>>) {
 
     // Establishing a connection
     let (user_tx, mut user_rx) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
+
+    let id = Uuid::new_v4();
+    let id = Uuid::to_string(&id);
     
     let rx = UnboundedReceiverStream::new(rx);
     
     tokio::spawn(rx.forward(user_tx));
-
-    println!("Connected");
     
     while let Some(result) = user_rx.next().await {
-        if result.is_ok() {
-            let result = result.unwrap();
-            
-            let result = result.to_str();
-            if result.is_ok() {
-                let result = result.unwrap();
-                //  !  tx sends message back for ws
-                //let message = server.process_message(result, tx);
-                //server.send(message);
-                tx.send(Ok(Message::text(format!("hello from service manager tcp server your message: {}", result)))).expect("Failed to send message");
-            }else{
-                break;
-            }
-
-        }else{
-            tx.send(Ok(Message::text("Error reading what was sent to tcp server"))).expect("Failed to send message");
+        match result {
+            Ok(x) => {
+                match x.to_str() {
+                    Ok(result) => {
+                        // processing message and return data
+                        match server.process_message(result, &id) {
+                            Ok(x) => {
+                                // service manager sends to websocekt user
+                                match server.send(&x, Sender::WS(&tx)) {
+                                    Ok(_) => (),
+                                    Err(err) => println!("error sending message: {}", err),
+                                }
+                            },
+                            Err(e) => {
+                                let e = e.produce_error();
+                                let error = format!("error processing your message: {}",e);
+                                let _ = server.send(&error, Sender::WS(&tx));
+                            }
+                        }
+                    },
+                    Err(_) => break,
+                }
+            },
+            Err(_) => tx.send(Ok(Message::text("Error reading what was sent to tcp server"))).expect("Failed to send message"),
         }
+
+        // }else{
+        //     tx.send(Ok(Message::text("Error reading what was sent to tcp server"))).expect("Failed to send message");
+        // }
         // broadcast_msg(result.expect("Failed to fetch message")).await;
     }
     // disconnected
+    println!("disconnected");
     
 }
 
@@ -195,9 +398,11 @@ fn test_server(port: &str) -> Res<()> {
 
                 let mut buffer = [0; 1024];
                 
-                stream.write_all(b"hello")?;
+                let _ = stream.write_all(b"hello");
 
-                let _ = stream.read(&mut buffer[..])?;
+                let n = stream.read(&mut buffer[..]).unwrap();
+
+                let buffer = &buffer[..n];
 
                 match String::from_utf8(buffer.into()) {
                     Ok(v) => println!("{}",v),
@@ -219,7 +424,8 @@ fn test_server(port: &str) -> Res<()> {
 pub async fn select_start(arg: &str) {
     match arg {
         "service" => {
-            let _ = ServiceManager::start_server().await;
+            let manager = ServiceManager::new();
+            let _ = ServiceManager::start_server(manager).await;
         },
         x => println!("Error unkown input: {}", x)
     }
@@ -237,6 +443,7 @@ pub fn start() {
 
     let mut processes: Vec<JoinHandle<()>> = Vec::new();
     let mut online_sm = false;
+    let mut online_db = false;
     let stdin = io::stdin();
     let mut iterator = stdin.lock().lines();
 
@@ -257,11 +464,23 @@ pub fn start() {
             },
             "sm" => {
                 if !online_sm {
+                    let manager = ServiceManager::new();
                     let x = tokio::task::spawn_blocking(|| {
-                        let _ = block_on(ServiceManager::start_server());
+                        let _ = block_on(ServiceManager::start_server(manager));
                     });
+
                     processes.push(x);
                     online_sm = true;
+                }
+            },
+            "db" => {
+                if !online_db {
+                    let manager = DataBaseManager::new();
+                    let y = tokio::task::spawn_blocking(move || {
+                        let _ = block_on(ServiceManager::start_tcp_server(manager,"8000"));
+                    });
+                    processes.push(y);
+                    online_db = true;
                 }
             },
             "test" => {
