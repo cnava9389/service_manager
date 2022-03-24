@@ -17,6 +17,7 @@ pub enum ServerError{
     FAILED_WRITE,
     INCOMPLETE_OPERATION,
     INCOMPATIBLE_DATA_TYPES,
+    ACCESS_DENIED
 }
 
 impl fmt::Display for ServerError {
@@ -92,6 +93,11 @@ impl ServerError {
                 //println!("Error: Incompatible data types");
                 "Error: Incompatible data types"
             }
+            ServerError::ACCESS_DENIED => {
+                //println!("Error: Incompatible data types");
+                "Error: Access Denied"
+            }
+            
         }
     }
 

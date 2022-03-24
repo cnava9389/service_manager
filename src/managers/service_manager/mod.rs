@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::Split;
 use std::sync::Arc;
 use super::{json, error, database_manager::DataBaseManager};
 use tokio::net::{TcpListener};
@@ -16,7 +17,7 @@ use std::net::SocketAddr;
 use uuid::Uuid;
 
 pub mod helper;
-use helper::{Store, EventQueue, Manager, Sender, TCPServers};
+use helper::{Store, EventQueue, Manager, Sender, TCPServers, login_func};
 
 pub use helper as other;
 
@@ -27,7 +28,7 @@ type Res<T> = Result<T, error::ServerError>;
 
 #[derive(Debug)]
 /// The service manager recieves and logs any operation and forwards it to the appropriate manager to deal with
-struct ServiceManager<'a> {
+pub struct ServiceManager<'a> {
     store: Store,
     servers: TCPServers<'a>,
     event_queue: EventQueue
@@ -61,9 +62,7 @@ impl<'a> ServiceManager<'a> {
     }
 
     // async fn remove_server(&self, k:&'a str) -> Res<()> {
-    //     let mut server = self.servers.write().await;
-        
-    //     Ok(())
+    //     self.servers.remove(k).await
     // }
 
     async fn contains_s_p(&self,k:&str,v:&str) -> Res<()> {
@@ -98,12 +97,20 @@ impl<'a> ServiceManager<'a> {
         // service manager for http and sockets
         let clone = manager.clone();
         let manager_filter = warp::any().map(move || clone.clone());
+
+        let cors = warp::cors()
+        .allow_origins(vec!["https://127.0.0.1:3000","http://127.0.0.1:3000","https://localhost:3000","http://localhost:3000"])
+        .allow_methods(vec!["GET","POST","DELETE","PUT","OPTIONS","HEAD"])
+        .allow_headers(vec!["User-Agent", "Sec-Fetch-Mode", "Referer", "Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers","Content-Type",
+        "Authorization","X-Request-With"]);
         
-        let chat = warp::path("ws")
+        let ws = warp::path("ws")
+            .and(warp::path::end())
             .and(warp::ws())
             // .and(users)
-            .and(manager_filter)
+            .and(manager_filter.clone())
             .map(|ws: warp::ws::Ws, ws_manager| ws.on_upgrade(move |socket| connect(socket, ws_manager)));
+            // .with(cors);
     
         // not found page
         let res_404 = warp::any().map(|| {
@@ -111,26 +118,37 @@ impl<'a> ServiceManager<'a> {
                 .status(warp::http::StatusCode::NOT_FOUND)
                 .body("404 Not Found!")
         });
+
+        let login = warp::path("login")
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::body::json())
+        .and(manager_filter.clone())
+        .and_then(login_func);
+        
+        // .map(|| "from login");
     
         // add all routes together. can modularize even further
-        let routes = chat.or(res_404);//.or(hello)
+        let routes = ws.or(login).or(res_404).with(cors);
         
         
         let test_env = dotenv::var("TEST").unwrap_or_else(|_|"false".to_string());
         
         // let clone = manager.clone();
         // tokio::task::spawn_blocking(move || {
-        //     let _ = block_on(ServiceManager::start_tcp_server(clone,"7878"));
-        // });
-
-        
-        if test_env == "true" {
-            let server = warp::serve(routes).try_bind(socket_addr);
-            println!("Running web server on {}!",socket_addr);
-            server.await
-        }else {
-            println!("Running server on :433!");
-            warp::serve(routes).tls().cert_path("./fullchain.pem").key_path("./privkey.pem").run(([127,0,0,1],433)).await;
+            //     let _ = block_on(ServiceManager::start_tcp_server(clone,"7878"));
+            // });
+            
+            
+            if test_env == "true" {
+                let server = warp::serve(routes).try_bind(socket_addr);
+                println!("Running web server on {}!",socket_addr);
+                server.await
+            }else {
+                println!("Running server on https://127.0.0.1:5000!");
+                let CERT= dotenv::var("CERT").unwrap_or_else(|_|"NA".to_string());
+                let KEY = dotenv::var("KEY").unwrap_or_else(|_|"NA".to_string());
+            warp::serve(routes).tls().cert_path(CERT).key_path(KEY).run(([127,0,0,1],5000)).await;
         }
         Ok(())
     }
@@ -160,6 +178,8 @@ impl<'a> ServiceManager<'a> {
                     match listener.accept().await {
                         Ok((mut socket, _addr)) => {
                             let manager = manager.clone();
+                            let id = Uuid::new_v4();
+                            let id = Uuid::to_string(&id);
                         // A new task is spawned for each inbound socket. The socket is
                         // moved to the new task and processed there.
                         tokio::spawn(async move {
@@ -182,7 +202,7 @@ impl<'a> ServiceManager<'a> {
                                 match std::str::from_utf8(&buf[..n]) {
                                     Ok(x) => {
                                         // process and get data
-                                        match manager.process_message(x, "") {
+                                        match manager.process_message(x, &id) {
                                             Ok(x) => {
                                                 match manager.send(&x, Sender::TCP(&mut socket)) {
                                                     Ok(_) => (),
@@ -214,6 +234,69 @@ impl<'a> ServiceManager<'a> {
         
     }
 
+    fn add_cmd(&self,cmd:&str, mut result:Split<&str>) -> Res<String> {
+        match cmd {
+            x => {
+                     let result_3 = result.next().unwrap_or_else(|| "");
+                     match block_on(self.contains_s_p(x, result_3)) {
+                         Ok(_) => {
+                             let addr;
+                             let result_3 = result_3.to_owned();
+                             if result_3.contains(":") {
+                                 addr = result_3;
+                             }else {
+                                 addr = format!("127.0.0.1:{}",result_3);
+                             }
+                             match TcpStream::connect(&addr){
+                                 Ok(stream) => {
+                                     let static_name = |x:&str| {
+                                         match x {
+                                             "TCP" => "TCP",
+                                             "DB" => "DB",
+                                             _ => "",
+                                         }
+                                     };
+                                     let name = static_name(x);
+                                     let _ = block_on(self.servers.insert_port(name, addr));
+                                     match block_on(self.new_server(name, stream)) {
+                                         Ok(_) => {
+                                             let user = dotenv::var("USER").unwrap_or_else(|_|"false".to_string());
+                                             let password= dotenv::var("PASSWORD").unwrap_or_else(|_|"false".to_string());
+                                             let cmd = format!("NEW {} {}",user, password);
+                                             match block_on(self.send_to_server(name, &cmd)){
+                                                 Ok(x) => {
+                                                     if x.contains("Error") || x.contains("error") {
+                                                         let _ = block_on(self.servers.remove_server(name));
+                                                         Err(error::ServerError::INCOMPLETE_OPERATION)
+                                                     }else { 
+                                                         Ok(x)
+                                                     }
+                                                 },
+                                                 Err(_) => {
+                                                     let _ = block_on(self.servers.remove_server(name));
+                                                     Err(error::ServerError::CONNECTION)
+                                                 }
+                                             }
+                                         }
+                                         Err(e) => {
+                                             Err(e)
+                                         }
+                                     }
+                                 },
+                                 Err(_) => {
+                                     Err(error::ServerError::CONNECTION)
+                                 },
+                             }
+                         },
+                         Err(e) => {
+                             Err(e)
+                         }
+                     }
+             }
+             // _ => Ok(format!("Invalid argument: {}",error::ServerError::produce_error(&error::ServerError::INVALID_ARG)))
+         }
+    }
+
 }
 
 impl fmt::Display for ServiceManager<'_> {
@@ -224,7 +307,7 @@ impl fmt::Display for ServiceManager<'_> {
 
 impl Manager for ServiceManager<'_> {
     // this needs to send message to tcp servers via commands and then return the data
-    fn process_message(&self, message: &str, id: &str) -> Res<String> {
+    fn process_message(&self, message: &str, _id: &str) -> Res<String> {
 
         let processed_message = json::to_value_from_str(message);
         let processed_message = match processed_message {
@@ -253,56 +336,7 @@ impl Manager for ServiceManager<'_> {
                                 let result_2 = result.next().unwrap_or_else(|| "");
                                 match result_1 {
                                     "ADD" => {
-                                        match result_2 {
-                                           x => {
-                                                    let result_3 = result.next().unwrap_or_else(|| "");
-                                                    match block_on(self.contains_s_p(x, result_3)) {
-                                                        Ok(_) => {
-                                                            let addr;
-                                                            let result_3 = result_3.to_owned();
-                                                            if result_3.contains(":") {
-                                                                addr = result_3;
-                                                            }else {
-                                                                addr = format!("127.0.0.1:{}",result_3);
-                                                            }
-                                                            match TcpStream::connect(&addr){
-                                                                Ok(stream) => {
-                                                                    let static_name = |x:&str| {
-                                                                        match x {
-                                                                            "TCP" => "TCP",
-                                                                            "DB" => "DB",
-                                                                            _ => "",
-                                                                        }
-                                                                    };
-                                                                    let name = static_name(x);
-                                                                    let _ = block_on(self.servers.insert_port(name, addr));
-                                                                    match block_on(self.new_server(name, stream)) {
-                                                                        Ok(_) => {
-                                                                            match block_on(self.send_to_server(name, "NEW")){
-                                                                                Ok(x) => Ok(format!("{}, id:{}",x,id)),
-                                                                                Err(_) => {
-                                                                                    let _ = block_on(self.servers.remove_server(name));
-                                                                                    Err(error::ServerError::CONNECTION)
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                        Err(e) => {
-                                                                            Err(e)
-                                                                        }
-                                                                    }
-                                                                },
-                                                                Err(_) => {
-                                                                    Err(error::ServerError::CONNECTION)
-                                                                },
-                                                            }
-                                                        },
-                                                        Err(e) => {
-                                                            Err(e)
-                                                        }
-                                                    }
-                                            }
-                                            // _ => Ok(format!("Invalid argument: {}",error::ServerError::produce_error(&error::ServerError::INVALID_ARG)))
-                                        }
+                                        self.add_cmd(result_2, result)
                                     },
                                     "MSG" => {
                                         let message = x_command.get("message");
@@ -326,7 +360,10 @@ impl Manager for ServiceManager<'_> {
                                                 Ok(String::from("Deleted server"))
                                             }
                                         }
-                                    }
+                                    },
+                                    "TEST" => {
+                                        Ok(format!("{:?}",self))
+                                    },
                                     _ => {
                                         let example = json::to_json!({"command":"command_for_service_manager server_name optional_argument","message":"server_command server_argument optional_argument"});
                                         let example = example.to_string();
@@ -413,9 +450,7 @@ async fn connect(ws: WebSocket, server: Arc<ServiceManager<'_>>) {
         // }
         // broadcast_msg(result.expect("Failed to fetch message")).await;
     }
-    // disconnected
-    println!("disconnected");
-    
+    // disconnected    
 }
 
 

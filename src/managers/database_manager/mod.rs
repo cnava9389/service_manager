@@ -1,7 +1,5 @@
-use std::{collections::HashMap, sync::Arc, path::Path, fs::{File, OpenOptions, self}, io::{BufReader, Seek}, fmt, str::Split, borrow::BorrowMut, iter::Peekable};
-use serde::{Serialize, Deserialize};
-use serde_json::{map::Entry, Map};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{collections::HashMap, sync::Arc, path::Path, fs::{File, OpenOptions, self}, io::{BufReader, Seek}, fmt, str::Split, iter::Peekable};
+use tokio::{io::{AsyncWriteExt}, sync::RwLockReadGuard};
 use futures::executor::block_on;
 use tokio::{sync::RwLock};
 
@@ -18,6 +16,8 @@ enum FileManager {
 #[derive(Debug)]
 pub struct DataBaseManager {
     file: RwLock<FileManager>,
+    permissions: RwLock<HashMap<String,json::JSON>>,
+    connections: RwLock<HashMap<String,String>>,
     store: RwLock<HashMap<String,json::JSON>>,
 }
 
@@ -30,16 +30,20 @@ impl fmt::Display for DataBaseManager {
 
 impl DataBaseManager {
     pub fn new() -> Arc<DataBaseManager> {
-        Arc::new(DataBaseManager{
+        let res = Arc::new(DataBaseManager{
             file: RwLock::new(FileManager::Closed),
+            permissions: RwLock::new(HashMap::new()),
+            connections: RwLock::new(HashMap::new()),
             store: RwLock::new(HashMap::new()),
-        })
+        });
+        let _ = block_on(res.load_permissions());
+        res
     }
     
-    async fn store_size(&self) -> usize {
-        let store = self.store.read().await;
-        store.len()
-    }
+    // async fn store_size(&self) -> usize {
+    //     let store = self.store.read().await;
+    //     store.len()
+    // }
 
     /// if a files is open the current store is saved to the file otherwise en error is returned
     fn save_store(&self) -> Res<String> {
@@ -62,6 +66,20 @@ impl DataBaseManager {
                     }
                 }
             },
+        }
+    }
+
+    fn save_permissions(&self) -> Res<()> {
+        let mut x = OpenOptions::new().append(true).open("./permissions.json").unwrap();
+        let store = block_on(self.permissions.write());
+        let _ = x.set_len(0);
+        let _ = x.rewind();
+        match serde_json::to_writer(x, &*store) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                println!("{}",e);
+                Err(error::ServerError::INVALID_JSON)
+            }
         }
     }
 
@@ -113,6 +131,38 @@ impl DataBaseManager {
         }
     }
 
+    async fn load_permissions(&self) -> Res<()> {
+        let x = OpenOptions::new().write(true).read(true).open("./permissions.json").unwrap();
+        let reader = BufReader::new(&x);
+        let map= serde_json::from_reader::<BufReader<&File>, json::JSON>(reader);
+        match map {
+            Ok(x) => {
+                match x {
+                    serde_json::Value::Object(mut x) => {
+                        let keys = x.keys().cloned().collect::<Vec<_>>();
+                        for k in keys {
+                            match x.remove(&k) {
+                                Some(v) => {
+                                    let _ = self.insert_to_store(k, v, 1).await ;
+                                },
+                                None => (),
+                            };
+                        };
+                        if x.len() != 0 {
+                            return Err(error::ServerError::INCOMPLETE_OPERATION);
+                        }
+                        Ok(())
+                    },
+                    _ => {
+                        Err(error::ServerError::INVALID_JSON)
+                    }
+                }
+            }
+            Err(_) => Err(error::ServerError::FAILED_READ),
+        }
+                
+    }
+
     /// loads json object from file into store if file is opened.
     async fn load_from_file(&self) -> Res<()> {
         let file = self.file.read().await;
@@ -131,7 +181,7 @@ impl DataBaseManager {
                                 for k in keys {
                                     match x.remove(&k) {
                                         Some(v) => {
-                                            let _ = self.insert_to_store(k, v).await ;
+                                            let _ = self.insert_to_store(k, v, 0).await ;
                                         },
                                         None => (),
                                     };
@@ -153,10 +203,16 @@ impl DataBaseManager {
     }
 
     /// inserts item into store. works with nested objects
-    async fn insert_to_store(&self, k:String, v:json::JSON) -> Res<()> {
+    async fn insert_to_store(&self, k:String, v:json::JSON, arg:u8) -> Res<()> {
         let key;
         let mut split;
-        let mut store = self.store.write().await;
+        let mut store;
+        if arg == 1 {
+            store = self.permissions.write().await;
+        }else {
+            store = self.store.write().await;
+        }
+
         let contains = k.contains(".");
         if contains {
             split = k.split(".").peekable();
@@ -205,12 +261,48 @@ impl DataBaseManager {
 }
 
 impl service_manager::other::Manager for DataBaseManager {
-    fn process_message(&self, message: &str, _id: &str) -> Res<String>{
+    fn process_message(&self, message: &str, id: &str) -> Res<String>{
+        // let permissions = block_on(self.permissions.read());
+        // let user = user.get(id);
+        // let error = match user {
+        //     Some(named_user) => {
+            //         match permissions.get(named_user) {
+        //             Some(_res) => {
+            //                 error::ServerError::NONE
+            //             }
+        //             None => error::ServerError::ACCESS_DENIED
+        //         }
+        //     },
+        //     None => error::ServerError::ACCESS_DENIED,
+        // };
+        
         let mut split = message.split(" ");
         let str = split.next().unwrap();
+        if str != "NEW" {
+            let user = block_on(self.connections.read());          
+    
+            if !user.contains_key(id) {
+                return Err(error::ServerError::ACCESS_DENIED)
+            }
+        }
+
         match str {
             "NEW" =>{
-                Ok("New connection to this db".to_owned())
+                let user = split.next().unwrap_or_else(|| "Error");
+                let password = split.next().unwrap_or_else(|| "Error");
+
+                let permissions = block_on(self.permissions.read());
+                let perm = &permissions;
+                
+                match check_permisions(perm, user, password) {
+                    Ok(ok) => {
+                        let mut connections = block_on(self.connections.write());
+                        connections.insert(id.to_owned(), user.to_owned());
+                        Ok(ok)
+                    },
+                    Err(err) => Err(err),
+                }
+                // Ok("New connection to this db".to_owned())
             },
             "OPEN" => {
                 let file = split.next().unwrap_or_else(|| "Error");
@@ -265,7 +357,7 @@ impl service_manager::other::Manager for DataBaseManager {
                 match value {
                     Ok(x) => {
                         let x_string = value_str;
-                        match block_on(self.insert_to_store(key.to_owned(), x)) {
+                        match block_on(self.insert_to_store(key.to_owned(), x, 0)) {
                             Ok(_) => Ok(x_string.to_owned()),
                             Err(e) => Err(e),
                         }
@@ -296,6 +388,7 @@ impl service_manager::other::Manager for DataBaseManager {
                 }
             },
             "SAVE" => {
+                let _ = self.save_permissions();
                 self.save_store()
             }
             _ => {
@@ -439,5 +532,49 @@ fn rec_ins(mut str_iter:Peekable<Split<&str>>, map: &mut json::JSON, val:json::J
         None => {
             Err(error::ServerError::FAILED_READ)
         }  
+    }
+}
+
+fn check_permisions(permissions:&RwLockReadGuard<HashMap<String, json::JSON>> ,user: &str, password: &str) -> Res<String> {
+    let map = permissions.get("super").unwrap_or_else(||&json::JSON::Null);
+    if map.is_null() {
+        return Err(error::ServerError::INCOMPATIBLE_DATA_TYPES)
+    };
+    
+    let super_val = map.get(user).unwrap_or_else(||&json::JSON::Null);
+    if super_val.is_null() {
+        return Err(error::ServerError::INCOMPATIBLE_DATA_TYPES)
+    };
+    match super_val {
+        serde_json::Value::String(pass) => {
+            if pass == password {
+                Ok("New connection to this db".to_owned())
+            }else { 
+                Err(error::ServerError::ACCESS_DENIED)
+            }
+        },
+        _ => {
+            let user_val = permissions.get("users").unwrap_or_else(||&json::JSON::Null);
+            if user_val.is_null() {
+                return Err(error::ServerError::INCOMPATIBLE_DATA_TYPES)
+            };
+            let user_val = user_val.get(user).unwrap_or_else(||&json::JSON::Null);
+            if user_val.is_null() {
+                return Err(error::ServerError::INCOMPATIBLE_DATA_TYPES)
+            };
+            match user_val {
+                serde_json::Value::String(pass) => {
+                    match super::session_manager::hash_match(password.as_bytes(), &pass) {
+                        Ok(_) => {
+                            Ok("New connection to this db".to_owned())
+                        },
+                        Err(_) => {
+                            Err(error::ServerError::ACCESS_DENIED)
+                        },
+                    }
+                },
+                _=> Err(error::ServerError::INVALID_JSON)
+            }
+        },
     }
 }

@@ -1,12 +1,15 @@
+use std::sync::Arc;
 use std::{collections::HashMap, time::Duration};
 use std::fmt;
 use futures::executor::block_on;
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
+use warp::body::bytes;
+use warp::reply::Json;
 use std::net::TcpStream as tcp;
 use tokio::sync::mpsc::UnboundedSender;
 use warp::ws::Message;
-use super::{json, error};
+use super::{json, error, super::session_manager};
 use std::io::{ prelude::*};
 
 
@@ -65,6 +68,13 @@ impl<'a> TCPServers<'a> {
             None => Ok(()),
         }
     }
+    
+    pub async fn remove (&self, k:&'a str) -> Res<()> {
+        let mut store = self.store.write().await;
+        store.remove(k);
+        Ok(())
+    }
+
     pub async fn contains_key (&self, k: &str) -> bool {
         self.store.read().await.contains_key(k)
     }
@@ -177,5 +187,45 @@ impl fmt::Display for EventQueue {
 impl EventQueue {
     pub fn new() -> EventQueue {
         EventQueue { queue: RwLock::new(Vec::new()) }
+    }
+}
+
+pub async fn login_func(data: json::JSON, _manager: Arc<super::ServiceManager<'_>>) -> Result<Json, warp::Rejection> {
+    let credentials = data;
+    
+    match credentials {
+    serde_json::Value::Object(ref map) => {
+
+        let value = map.get("email").unwrap_or_else(|| &json::JSON::Null);
+
+        match value {
+
+            serde_json::Value::String(email) => {
+
+                let bytes_credentials = credentials.to_string();
+                let bytes_credentials = bytes_credentials.as_bytes();
+            
+                let hash = session_manager::hash_bytes(bytes_credentials);
+            
+                match hash {
+                    Ok(hash) => {
+                        let credentials = warp::reply::json(&hash);
+            
+                        Ok(credentials)
+                    }
+                    Err(_) => {
+                        Err(warp::reject::reject())
+                    }
+                }
+            },
+            _ => {
+                Err(warp::reject::reject())
+            }
+        }
+    },   
+        _ => { 
+            Err(warp::reject::reject())
+        }
+   // Err(warp::reject::reject())
     }
 }
